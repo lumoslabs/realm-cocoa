@@ -761,7 +761,6 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
         return realm->_realm->config().schema_version;
     }
 
-    NSError *error;
     try {
         Realm::Config config;
         config.path = realmPath.UTF8String;
@@ -773,7 +772,7 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
         return version;
     }
     catch (std::exception *exp) {
-        RLMSetErrorOrThrow(error, outError);
+        RLMSetErrorOrThrow(RLMMakeError(RLMErrorFail, *exp), outError);
         return RLMNotVersioned;
     }
 }

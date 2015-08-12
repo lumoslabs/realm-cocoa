@@ -60,6 +60,8 @@ RLM_ASSUME_NONNULL_BEGIN
 /// The block which migrates the Realm to the current version.
 @property (nonatomic, copy, nullable) RLMMigrationBlock migrationBlock;
 
+@property (nonatomic, copy, nullable) RLMSchema *customSchema;
+
 @end
 
 RLM_ASSUME_NONNULL_END

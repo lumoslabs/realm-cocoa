@@ -33,6 +33,8 @@ RLM_ASSUME_NONNULL_BEGIN
  */
 @interface RLMSchema : NSObject<NSCopying>
 
++ (instancetype)schemaWithObjectSubclasses:(NSArray *)classes;
+
 /**
  An NSArray containing RLMObjectSchema's for all object types in this Realm. Meant
  to be used during migrations for dynamic introspection.

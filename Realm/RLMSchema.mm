@@ -21,6 +21,7 @@
 #import "RLMAccessor.h"
 #import "RLMObject_Private.hpp"
 #import "RLMObjectSchema_Private.hpp"
+#import "RLMProperty_Private.h"
 #import "RLMRealm_Private.hpp"
 #import "RLMSwiftSupport.h"
 #import "RLMUtil.hpp"
@@ -39,9 +40,28 @@ const uint64_t RLMNotVersioned = realm::ObjectStore::NotVersioned;
 @end
 
 static RLMSchema *s_sharedSchema;
+static RLMSchema *s_partialSharedSchema;
 static NSMutableDictionary *s_localNameToClass;
 
 @implementation RLMSchema
+
++ (instancetype)schemaWithObjectSubclasses:(NSArray *)classes {
+    NSUInteger count = classes.count;
+    Class *classArray = static_cast<Class *>(malloc(count * sizeof(Class)));
+    [classes getObjects:classArray range:NSMakeRange(0, count)];
+    [self registerClasses:classArray count:count];
+
+    RLMSchema *schema = [[self alloc] init];
+    NSMutableArray *schemas = [NSMutableArray arrayWithCapacity:count];
+    for (Class cls in classes) {
+        if (!RLMIsObjectSubclass(cls)) {
+            @throw RLMException([NSString stringWithFormat:@"Can't add non-Object type '%@' to a schema.", cls]);
+        }
+        [schemas addObject:[cls sharedSchema]];
+    }
+    schema.objectSchema = schemas;
+    return schema;
+}
 
 - (RLMObjectSchema *)schemaForClassName:(NSString *)className {
     return _objectSchemaByName[className];
@@ -71,18 +91,22 @@ static NSMutableDictionary *s_localNameToClass;
     }
     initialized = true;
 
-    NSMutableArray *schemaArray = [NSMutableArray array];
-    RLMSchema *schema = [[RLMSchema alloc] init];
+    s_localNameToClass = [NSMutableDictionary dictionary];
+    s_partialSharedSchema = [[RLMSchema alloc] init];
+}
 
-    unsigned int numClasses;
-    Class *classes = objc_copyClassList(&numClasses);
++ (instancetype)partialSharedSchema {
+    return s_partialSharedSchema;
+}
 
++ (void)registerClasses:(Class *)classes count:(NSUInteger)count {
     // first create class to name mapping so we can do array validation
     // when creating object schema
-    s_localNameToClass = [NSMutableDictionary dictionary];
-    for (unsigned int i = 0; i < numClasses; i++) {
+    for (NSUInteger i = 0; i < count; i++) {
         Class cls = classes[i];
+
         static Class objectBaseClass = [RLMObjectBase class];
+
         if (!RLMIsKindOfClass(cls, objectBaseClass) || ![cls shouldPersistToRealm]) {
             continue;
         }
@@ -99,20 +123,23 @@ static NSMutableDictionary *s_localNameToClass;
             @throw RLMException(message);
         }
 
-        if (s_localNameToClass[className]) {
-            NSString *message = [NSString stringWithFormat:@"RLMObject subclasses with the same name cannot be included twice in the same target. Please make sure '%@' is only linked once to your current target.", className];
-            @throw RLMException(message);
+        if (Class existingClass = s_localNameToClass[className]) {
+            if (existingClass != cls) {
+                NSString *message = [NSString stringWithFormat:@"RLMObject subclasses with the same name cannot be included twice in the same target. Please make sure '%@' is only linked once to your current target.", className];
+                @throw RLMException(message);
+            }
         }
+
         s_localNameToClass[className] = cls;
 
-        // override classname for all valid classes
         RLMReplaceClassNameMethod(cls, className);
+        RLMReplaceSharedSchemaMethod(cls, nil);
     }
 
-    // process all RLMObject subclasses
+    NSMutableArray *schemas = [NSMutableArray arrayWithCapacity:s_localNameToClass.count];
     for (Class cls in s_localNameToClass.allValues) {
         RLMObjectSchema *schema = [RLMObjectSchema schemaForObjectClass:cls];
-        [schemaArray addObject:schema];
+        [schemas addObject:schema];
 
         // override sharedSchema classs methods for performance
         RLMReplaceSharedSchemaMethod(cls, schema);
@@ -120,17 +147,31 @@ static NSMutableDictionary *s_localNameToClass;
         // set standalone class on shared shema for standalone object creation
         schema.standaloneClass = RLMStandaloneAccessorClassForObjectClass(schema.objectClass, schema);
     }
-    free(classes);
 
-    // set class array
-    schema.objectSchema = schemaArray;
-
-    // set shared schema
-    s_sharedSchema = schema;
+    s_partialSharedSchema.objectSchema = [[s_partialSharedSchema objectSchema] arrayByAddingObjectsFromArray:schemas] ?: schemas;
 }
 
 // schema based on runtime objects
 + (instancetype)sharedSchema {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        RLMSchema *schema = [[RLMSchema alloc] init];
+
+        unsigned int numClasses;
+        Class *classes = objc_copyClassList(&numClasses);
+        [self registerClasses:classes count:numClasses];
+        free(classes);
+        
+        // set class array
+        schema.objectSchema = s_partialSharedSchema.objectSchema;
+        
+        // set shared schema
+        s_sharedSchema = schema;
+    });
+    return s_sharedSchema;
+}
+
++ (bool)isSharedSchemaInitialized {
     return s_sharedSchema;
 }
 

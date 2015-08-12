@@ -528,6 +528,7 @@ static Schema RLMObjectStoreSchemaForRLMSchema(RLMSchema *rlmSchema) {
     clearMigrationCache();
     clearKeyCache();
     RLMClearRealmCache();
+    realm::Realm::s_global_cache.clear();
     s_defaultRealmPath = [RLMRealm writeablePathForFile:c_defaultRealmFileName];
 }
 

@@ -352,6 +352,56 @@ static void RLMRealmSetSchemaAndAlign(RLMRealm *realm, RLMSchema *targetSchema) 
     return RLMAutorelease(realm);
 }
 
++ (SharedRealm)openSharedRealm:(Realm::Config &)config error:(NSError **)outError {
+    try {
+        return Realm::get_shared_realm(config);
+    }
+    catch (RealmFileException &ex) {
+        switch (ex.kind()) {
+            case RealmFileException::Kind::PermissionDenied: {
+                NSString *mode = config.read_only ? @"read" : @"read-write";
+                NSString *additionalMessage = [NSString stringWithFormat:@"Unable to open a realm at path '%@'. Please use a path where your app has %@ permissions.", @(config.path.c_str()), mode];
+                NSString *newMessage = [NSString stringWithFormat:@"%s\n%@", ex.what(), additionalMessage];
+                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFilePermissionDenied, File::PermissionDenied(newMessage.UTF8String)), outError);
+                break;
+            }
+            case RealmFileException::Kind::IncompatibleLockFile: {
+                NSString *err = @"Realm file is currently open in another process "
+                "which cannot share access with this process. All "
+                "processes sharing a single file must be the same "
+                "architecture. For sharing files between the Realm "
+                "Browser and an iOS simulator, this means that you "
+                "must use a 64-bit simulator.";
+                RLMSetErrorOrThrow(RLMMakeError(RLMErrorIncompatibleLockFile, File::PermissionDenied(err.UTF8String)), outError);
+                break;
+            }
+            case RealmFileException::Kind::Exists:
+                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFileExists, ex), outError);
+                break;
+            case RealmFileException::Kind::AccessError:
+                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFileAccessError, ex), outError);
+                break;
+            default:
+                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFail, ex), outError);
+                break;
+        }
+        return nullptr;
+    }
+    catch(const std::exception &exp) {
+        RLMSetErrorOrThrow(RLMMakeError(RLMErrorFail, exp), outError);
+        return nullptr;
+    }
+}
+
+static Schema RLMObjectStoreSchemaForRLMSchema(RLMSchema *rlmSchema) {
+    Schema schema;
+    for (RLMObjectSchema *objectSchema in rlmSchema.objectSchema) {
+        ObjectSchema os = objectSchema.objectStoreCopy;
+        schema.emplace(os.name, move(os));
+    }
+    return schema;
+}
+
 + (instancetype)realmWithPath:(NSString *)path
                           key:(NSData *)key
                      readOnly:(BOOL)readonly
@@ -409,78 +459,33 @@ static void RLMRealmSetSchemaAndAlign(RLMRealm *realm, RLMSchema *targetSchema) 
         }
     };
 
-    try {
-        realm->_realm = Realm::get_shared_realm(config);
-    }
-    catch (RealmFileException &ex) {
-        switch (ex.kind()) {
-            case RealmFileException::Kind::PermissionDenied: {
-                NSString *mode = readonly ? @"read" : @"read-write";
-                NSString *additionalMessage = [NSString stringWithFormat:@"Unable to open a realm at path '%@'. Please use a path where your app has %@ permissions.", path, mode];
-                NSString *newMessage = [NSString stringWithFormat:@"%s\n%@", ex.what(), additionalMessage];
-                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFilePermissionDenied, File::PermissionDenied(newMessage.UTF8String)), outError);
-                break;
-            }
-            case RealmFileException::Kind::IncompatibleLockFile: {
-                NSString *err = @"Realm file is currently open in another process "
-                                "which cannot share access with this process. All "
-                                "processes sharing a single file must be the same "
-                                "architecture. For sharing files between the Realm "
-                                "Browser and an iOS simulator, this means that you "
-                                "must use a 64-bit simulator.";
-                RLMSetErrorOrThrow(RLMMakeError(RLMErrorIncompatibleLockFile, File::PermissionDenied(err.UTF8String)), outError);
-                break;
-            }
-            case RealmFileException::Kind::Exists:
-                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFileExists, ex), outError);
-                break;
-            case RealmFileException::Kind::AccessError:
-                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFileAccessError, ex), outError);
-                break;
-            default:
-                RLMSetErrorOrThrow(RLMMakeError(RLMErrorFail, ex), outError);
-                break;
-        }
-        return nil;
-    }
-    catch(const std::exception &exp) {
-        RLMSetErrorOrThrow(RLMMakeError(RLMErrorFail, exp), outError);
-        return nil;
-    }
-
-    // we need to protect the realm cache and accessors cache
+    // protects the realm cache and accessors cache
     static id initLock = [NSObject new];
     @synchronized(initLock) {
-        // check cache for existing cached realms with the same path
-        RLMRealm *existingRealm = RLMGetAnyCachedRealmForPath(path);
-        if (existingRealm) {
-            // if we have a cached realm on another thread, copy without a transaction
-            realm.schema = [existingRealm.schema shallowCopy];
+        realm->_realm = [self openSharedRealm:config error:outError];
+        if (!realm->_realm) {
+            return nil;
+        }
+
+        // if we have a cached realm on another thread, copy without a transaction
+        if (RLMRealm *cachedRealm = RLMGetAnyCachedRealmForPath(path)) {
+            realm.schema = [cachedRealm.schema shallowCopy];
             for (RLMObjectSchema *objectSchema in realm.schema.objectSchema) {
                 objectSchema.realm = realm;
             }
         }
         else {
-            // if we are the first realm at this path, set/align schema or perform migration if needed
-            RLMSchema *targetSchema = customSchema ?: [RLMSchema.sharedSchema copy];
-            Schema schema;
-            for (RLMObjectSchema *objectSchema in targetSchema.objectSchema) {
-                ObjectSchema os = objectSchema.objectStoreCopy;
-                schema.emplace(os.name, move(os));
-            }
+            // set/align schema or perform migration if needed
             uint64_t newVersion = schemaVersionForPath(path);
             try {
+                RLMSchema *targetSchema = customSchema ?: [RLMSchema.sharedSchema copy];
+                Schema schema = RLMObjectStoreSchemaForRLMSchema(targetSchema);
                 realm->_realm->update_schema(schema, newVersion);
                 RLMRealmSetSchemaAndAlign(realm, targetSchema);
             } catch (const std::exception & exception) {
                 RLMSetErrorOrThrow(RLMMakeError(RLMException(exception)), outError);
                 return nil;
             }
-        }
-
-        // initializing the schema started a read transaction, so end it
-        if (!readonly) {
-            [realm invalidate];
         }
 
         if (!dynamic) {
@@ -490,6 +495,9 @@ static void RLMRealmSetSchemaAndAlign(RLMRealm *realm, RLMSchema *targetSchema) 
     }
 
     if (!readonly) {
+        // initializing the schema started a read transaction, so end it
+        [realm invalidate];
+
         realm.notifier = [[RLMNotifier alloc] initWithRealm:realm error:outError];
         if (!realm.notifier) {
             return nil;
